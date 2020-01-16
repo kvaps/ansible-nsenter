@@ -1,31 +1,43 @@
-# Based on local.py (c) 2012, Michael DeHaan <michael.dehaan@gmail.com>
+# Based on the kubectl connection plugin
 #
-# (c) 2013, Maykel Moya <mmoya@speedyrails.com>
-# (c) 2015, Toshio Kuratomi <tkuratomi@ansible.com>
-# Copyright (c) 2017 Ansible Project
-# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
-
+# Connection plugin for configuring process namespaces with nsenter
+# (c) 2020, kvaps <kvapss@gmail.com>
+#
+# This file is part of Ansible
+#
+# Ansible is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Ansible is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
 DOCUMENTATION = """
     author: kvaps <kvapss@gmail.com>
     connection: nsenter
-    short_description: Interact with pid namespace
+    short_description: Run tasks in process namespace via nsenter
     description:
-        - Run commands or put/fetch files to an existing pid namespace on the Ansible controller.
-    version_added: "2.9"
+      - Run commands or put/fetch files to an existing process namespace using nsenter on the Ansible controller.
+    version_added: "2.10"
     options:
       remote_addr:
         description:
-            - Target process id which namespaces you want to access
-        default: inventory_hostname
+          - Target process id which namespaces you want to access
+        type: int
         vars:
-            - name: ansible_host
+          - name: ansible_host
         default: 1
       executable:
         description:
-            - User specified executable shell
+          - User specified executable shell
         ini:
           - section: defaults
             key: executable
@@ -34,43 +46,143 @@ DOCUMENTATION = """
         vars:
           - name: ansible_executable
         default: /bin/sh
-      nsenter_exe:
+      nsenter_mount:
         description:
-            - User specified nsenter binary
+          - Enter the mount namespace.
+        type: boolean
         ini:
           - section: nsenter_connection
-            key: exe
+            key: mount
         env:
-          - name: ANSIBLE_NSENTER_EXE
+          - name: ANSIBLE_NSENTER_MOUNT
         vars:
-          - name: ansible_nsenter_exe
-        default: nsenter
+          - name: ansible_nsenter_mount
+        default: 'yes'
+      nsenter_utc:
+        description:
+          - Enter the UTC namespace.
+        type: boolean
+        ini:
+          - section: nsenter_connection
+            key: utc
+        env:
+          - name: ANSIBLE_NSENTER_UTC
+        vars:
+          - name: ansible_nsenter_utc
+        default: 'yes'
+      nsenter_ipc:
+        description:
+            - Enter the IPC namespace.
+        type: boolean
+        ini:
+          - section: nsenter_connection
+            key: ipc
+        env:
+          - name: ANSIBLE_NSENTER_IPC
+        vars:
+          - name: ansible_nsenter_ipc
+        default: 'yes'
+      nsenter_net:
+        description:
+          - Enter the network namespace.
+        type: boolean
+        ini:
+          - section: nsenter_connection
+            key: network
+        env:
+          - name: ANSIBLE_NSENTER_NET
+        vars:
+          - name: ansible_nsenter_net
+        default: 'yes'
+      nsenter_pid:
+        description:
+          - Enter the PID namespace.
+        type: boolean
+        ini:
+          - section: nsenter_connection
+            key: pid
+        env:
+          - name: ANSIBLE_NSENTER_PID
+        vars:
+          - name: ansible_nsenter_pid
+        default: 'yes'
+      nsenter_user:
+        description:
+          - Enter the user namespace.
+        type: boolean
+        ini:
+          - section: nsenter_connection
+            key: user
+        env:
+          - name: ANSIBLE_NSENTER_USER
+        vars:
+          - name: ansible_nsenter_user
+        default: 'no'
+      nsenter_uid:
+        description:
+          - Set the user ID which will be used in the entered namespace.
+          - If no user ID is supplied, Ansible will let the nsenter binary choose the user ID as it normally
+        type: integer
+        ini:
+          - section: nsenter_connection
+            key: uid
+        env:
+          - name: ANSIBLE_NSENTER_UID
+        vars:
+          - name: ansible_nsenter_uid
+      nsenter_gid:
+        description:
+          - Set the group ID which will be used in the entered namespace and drop supplementary groups.
+          - If no group ID is supplied, Ansible will let the nsenter binary choose the group ID as it normally
+        type: integer
+        ini:
+          - section: nsenter_connection
+            key: gid
+        env:
+          - name: ANSIBLE_NSENTER_GID
+        vars:
+          - name: ansible_nsenter_gid
 """
 
+import distutils.spawn
 import os
 import os.path
 import subprocess
-import traceback
 
-from ansible.errors import AnsibleError
-from ansible.module_utils.basic import is_executable
-from ansible.module_utils.common.process import get_bin_path
+import ansible.constants as C
+from ansible.parsing.yaml.loader import AnsibleLoader
+from ansible.errors import AnsibleError, AnsibleFileNotFound
 from ansible.module_utils.six.moves import shlex_quote
-from ansible.module_utils._text import to_bytes, to_native
+from ansible.module_utils._text import to_bytes
 from ansible.plugins.connection import ConnectionBase, BUFSIZE
 from ansible.utils.display import Display
 
 display = Display()
 
 
+CONNECTION_TRANSPORT = 'nsenter'
+
+CONNECTION_OPTIONS = {
+    'nsenter_mount': '-m',
+    'nsenter_utc': '-u',
+    'nsenter_ipc': '-i',
+    'nsenter_net': '-n',
+    'nsenter_pid': '-p',
+    'nsenter_user': '-U',
+    'nsenter_uid': '-S',
+    'nsenter_gid': '-G',
+}
+
+
 class Connection(ConnectionBase):
     ''' Local nsenter based connections '''
 
-    transport = 'nsenter'
+    transport = CONNECTION_TRANSPORT
+    connection_options = CONNECTION_OPTIONS
+    connection_options = CONNECTION_OPTIONS
+    documentation = DOCUMENTATION
     has_pipelining = True
-    # su currently has an undiagnosed issue with calculating the file
-    # checksums (so copy, for instance, doesn't work right)
-    # Have to look into that before re-enabling this
+    transport_cmd = None
     has_tty = False
 
     default_user = 'root'
@@ -78,57 +190,63 @@ class Connection(ConnectionBase):
     def __init__(self, play_context, new_stdin, *args, **kwargs):
         super(Connection, self).__init__(play_context, new_stdin, *args, **kwargs)
 
-        self.pid = self._play_context.remote_addr
+        self.target = self._play_context.remote_addr
 
-        if os.geteuid() != 0:
-            raise AnsibleError("nsenter connection requires running as root")
+        cmd_arg = '{0}_command'.format(self.transport)
+        if cmd_arg in kwargs:
+            self.transport_cmd = kwargs[cmd_arg]
+        else:
+            self.transport_cmd = distutils.spawn.find_executable(self.transport)
+            if not self.transport_cmd:
+                raise AnsibleError("{0} command not found in PATH".format(self.transport))
 
-        if not self.pid.isdigit():
-            raise AnsibleError("%s is not valid pid" % self.pid)
+        # do some trivial checks for ensuring 'host' is actually a process ID
+        if not self.target.isdigit():
+            raise AnsibleError("specified target (%s) is not valid pid" % self.target)
 
         try:
-            os.kill(int(self.pid), 0)
+            os.kill(int(self.target), 0)
         except OSError:
-            raise AnsibleError("a process with pid %d does not exist" % self.pid)
+            raise AnsibleError("a target pid (%d) does not exist" % self.target)
+
+    def _build_exec_cmd(self, cmd):
+        """ Build the local nsenter command to run cmd on remote_host
+        """
+        local_cmd = [self.transport_cmd, '-t', self.target]
+        executable = self.get_option('executable')
+
+        # Build command options based on doc string
+        doc_yaml = AnsibleLoader(self.documentation).get_single_data()
+        for key in doc_yaml.get('options'):
+            if key in ['nsenter_uid', 'nsenter_gid'] and self.get_option(key) is not None:
+                cmd_arg = self.connection_options[key]
+                local_cmd += [cmd_arg, self.get_option(key)]
+            elif self.get_option(key) and self.connection_options.get(key):
+                cmd_arg = self.connection_options[key]
+                local_cmd += [cmd_arg]
+
+        local_cmd += ['-F', '--'] + cmd
+
+        return local_cmd
 
     def _connect(self):
         ''' connect to the nsenter '''
-        if os.path.isabs(self.get_option('nsenter_exe')):
-            self.nsenter_cmd = self.get_option('nsenter_exe')
-        else:
-            self.nsenter_cmd = get_bin_path(self.get_option('nsenter_exe'))
-
-        if not self.nsenter_cmd:
-            raise AnsibleError("nsenter command (%s) not found in PATH" % to_native(self.get_option('nsenter_exe')))
 
         super(Connection, self)._connect()
         if not self._connected:
-            display.vvv("THIS IS A PID NAMESPACE", host=self.pid)
+            display.vvv(u"ESTABLISH {0} CONNECTION".format(self.transport), host=self.target)
             self._connected = True
 
-    def _buffered_exec_command(self, cmd, stdin=subprocess.PIPE):
-        ''' run a command on the nsenter.  This is only needed for implementing
-        put_file() get_file() so that we don't have to read the whole file
-        into memory.
-
-        compared to exec_command() it looses some niceties like being able to
-        return the process's exit code immediately.
-        '''
-        executable = self.get_option('executable')
-        local_cmd = [self.nsenter_cmd, '-t', self.pid, '-m', '-u', '-i', '-n', '-p', '-F', '--', executable, '-c', cmd]
-
-        display.vvv("EXEC %s" % (local_cmd), host=self.pid)
-        local_cmd = [to_bytes(i, errors='surrogate_or_strict') for i in local_cmd]
-        p = subprocess.Popen(local_cmd, shell=False, stdin=stdin,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        return p
-
     def exec_command(self, cmd, in_data=None, sudoable=False):
-        ''' run a command on the nsenter '''
+        ''' run a command on the process namespace '''
         super(Connection, self).exec_command(cmd, in_data=in_data, sudoable=sudoable)
 
-        p = self._buffered_exec_command(cmd)
+        local_cmd = self._build_exec_cmd([self._play_context.executable, '-c', cmd])
+
+        display.vvv("EXEC %s" % (local_cmd,), host=self.target)
+        local_cmd = [to_bytes(i, errors='surrogate_or_strict') for i in local_cmd]
+        p = subprocess.Popen(local_cmd, shell=False, stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         stdout, stderr = p.communicate(in_data)
         return (p.returncode, stdout, stderr)
@@ -148,56 +266,61 @@ class Connection(ConnectionBase):
         return os.path.normpath(remote_path)
 
     def put_file(self, in_path, out_path):
-        ''' transfer a file from local to nsenter '''
+        ''' Transfer a file from local to process namespace '''
         super(Connection, self).put_file(in_path, out_path)
-        display.vvv("PUT %s TO %s" % (in_path, out_path), host=self.pid)
+        display.vvv("PUT %s TO %s" % (in_path, out_path), host=self._play_context.remote_addr)
 
-        out_path = shlex_quote(self._prefix_login_path(out_path))
-        try:
-            with open(to_bytes(in_path, errors='surrogate_or_strict'), 'rb') as in_file:
-                if not os.fstat(in_file.fileno()).st_size:
-                    count = ' count=0'
-                else:
-                    count = ''
-                try:
-                    p = self._buffered_exec_command('dd of=%s bs=%s%s' % (out_path, BUFSIZE, count), stdin=in_file)
-                except OSError:
-                    raise AnsibleError("nsenter connection requires dd command in the PID namespace")
-                try:
-                    stdout, stderr = p.communicate()
-                except Exception:
-                    traceback.print_exc()
-                    raise AnsibleError("failed to transfer file %s to %s" % (in_path, out_path))
-                if p.returncode != 0:
-                    raise AnsibleError("failed to transfer file %s to %s:\n%s\n%s" % (in_path, out_path, stdout, stderr))
-        except IOError:
-            raise AnsibleError("file or module does not exist at: %s" % in_path)
+        out_path = self._prefix_login_path(out_path)
+        if not os.path.exists(to_bytes(in_path, errors='surrogate_or_strict')):
+            raise AnsibleFileNotFound(
+                "file or module does not exist: %s" % in_path)
 
-    def fetch_file(self, in_path, out_path):
-        ''' fetch a file from nsenter to local '''
-        super(Connection, self).fetch_file(in_path, out_path)
-        display.vvv("FETCH %s TO %s" % (in_path, out_path), host=self.pid)
-
-        in_path = shlex_quote(self._prefix_login_path(in_path))
-        try:
-            p = self._buffered_exec_command('dd if=%s bs=%s' % (in_path, BUFSIZE))
-        except OSError:
-            raise AnsibleError("nsenter connection requires dd command in the PID namespace")
-
-        with open(to_bytes(out_path, errors='surrogate_or_strict'), 'wb+') as out_file:
+        out_path = shlex_quote(out_path)
+        with open(to_bytes(in_path, errors='surrogate_or_strict'), 'rb') as in_file:
+            if not os.fstat(in_file.fileno()).st_size:
+                count = ' count=0'
+            else:
+                count = ''
+            args = self._build_exec_cmd([self._play_context.executable, "-c", "dd of=%s bs=%s%s" % (out_path, BUFSIZE, count)])
+            args = [to_bytes(i, errors='surrogate_or_strict') for i in args]
             try:
-                chunk = p.stdout.read(BUFSIZE)
-                while chunk:
-                    out_file.write(chunk)
-                    chunk = p.stdout.read(BUFSIZE)
-            except Exception:
-                traceback.print_exc()
-                raise AnsibleError("failed to transfer file %s to %s" % (in_path, out_path))
+                p = subprocess.Popen(args, stdin=in_file,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except OSError:
+                raise AnsibleError("nsenter connection requires dd command in the container to put files")
             stdout, stderr = p.communicate()
+
             if p.returncode != 0:
                 raise AnsibleError("failed to transfer file %s to %s:\n%s\n%s" % (in_path, out_path, stdout, stderr))
 
+    def fetch_file(self, in_path, out_path):
+        ''' Fetch a file from process namespace to local '''
+        super(Connection, self).fetch_file(in_path, out_path)
+        display.vvv("FETCH %s TO %s" % (in_path, out_path), host=self.target)
+
+        in_path = self._prefix_login_path(in_path)
+        out_dir = os.path.dirname(out_path)
+
+        args = self._build_exec_cmd([self._play_context.executable, "-c", "dd if=%s bs=%s" % (in_path, BUFSIZE)])
+        args = [to_bytes(i, errors='surrogate_or_strict') for i in args]
+        actual_out_path = os.path.join(out_dir, os.path.basename(in_path))
+        with open(to_bytes(actual_out_path, errors='surrogate_or_strict'), 'wb') as out_file:
+            try:
+                p = subprocess.Popen(args, stdin=subprocess.PIPE,
+                                     stdout=out_file, stderr=subprocess.PIPE)
+            except OSError:
+                raise AnsibleError(
+                    "{0} connection requires dd command in the container to fetch files".format(self.transport)
+                )
+            stdout, stderr = p.communicate()
+
+            if p.returncode != 0:
+                raise AnsibleError("failed to fetch file %s to %s:\n%s\n%s" % (in_path, out_path, stdout, stderr))
+
+        if actual_out_path != out_path:
+            os.rename(to_bytes(actual_out_path, errors='strict'), to_bytes(out_path, errors='strict'))
+
     def close(self):
-        ''' terminate the connection; nothing to do here '''
+        ''' Terminate the connection; Nothing to do here '''
         super(Connection, self).close()
         self._connected = False
